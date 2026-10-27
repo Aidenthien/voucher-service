@@ -10,4 +10,7 @@ public interface RedemptionRepository extends JpaRepository<Redemption, Long> {
     List<Redemption> findByVoucherId(Long voucherId);
 
     List<Redemption> findByCampaignId(Long campaignId);
+
+    // Counts every redemption row, including ones whose voucher was later voided.
+    long countByCampaignIdAndUserId(Long campaignId, String userId);
 }

@@ -1,0 +1,1230 @@
+
+> <ide_opened_file>The user opened the file d:\projects\voucher-service-takehom
+  e\voucher-service-takehome\voucher-service\src\main\resources\schema.sql in
+  the IDE. This may or may not be related to the current
+  task.</ide_opened_file>
+
+> @voucher-service-takehome/ understand this project source code and study it
+  coding structure, coding pattern, folder structure, architecture, flow from
+  the start will the end like how it receives the data, hand it to the backend,
+  and return back to the frontend. You may read the
+  @voucher-service-takehome/voucher-service-takehome/voucher-service/README.md
+  for more details so you can understand the structure more quickly and better
+  ⎿  Listed directory voucher-service-takehome\
+  ⎿  Read
+     voucher-service-takehome\voucher-service-takehome\voucher-service\README.md
+     (38 lines)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● I've read every file in the project. It's small: 13 Java classes, 3 SQL/YAML
+  resource files and 1 test class. One thing to know first: there's no frontend
+  in this repo. The "frontend" is the client's storefront, which calls this
+  service over plain HTTP and gets JSON back. BRIEF.md says your task is adding
+  a per-user redemption limit.
+
+  1. Tech stack
+
+  - Java 17, Spring Boot 3.2.5, Gradle. See build.gradle
+    (voucher-service/build.gradle).
+  - Spring Web for the REST controllers, Spring Data JPA with Hibernate for
+    persistence, and the H2 in-memory DB.
+  - spring-boot-starter-validation is a dependency, but nothing uses it.
+  - application.yml (voucher-service/src/main/resources/application.yml) sets
+    ddl-auto: none and sql.init.mode: always. Hibernate never generates tables.
+    Instead, schema.sql (voucher-service/src/main/resources/schema.sql) drops
+    and recreates everything on each boot, then data.sql
+    (voucher-service/src/main/resources/data.sql) seeds it. There's no Flyway or
+    Liquibase.
+  - On Windows, rename gradlew.bat.txt to gradlew.bat before running.
+
+  2. Folder structure (classic layered architecture)
+
+  com.prizm.campaign
+  ├── CampaignApplication.java     @SpringBootApplication entry point
+  ├── controller/                  HTTP layer: maps URL to service call, returns
+  DTO
+  │   ├── VoucherController        /vouchers/{code}/redeem,
+  /vouchers/{code}/void
+  │   └── CampaignController       /campaigns/{id}/stats,
+  /campaigns/by-client/{code}/stats
+  ├── service/                     business logic
+  │   ├── VoucherService           redeem + void rules
+  │   ├── CampaignStatsService     builds stats
+  │   └── AuditClient              outbound HTTP call to an audit service
+  ├── repository/                  Spring Data JPA interfaces (derived queries,
+  no SQL)
+  │   ├── VoucherRepository        findByCode, findByCampaignId
+  │   ├── CampaignRepository       findByClientCode
+  │   └── RedemptionRepository     findByVoucherId, findByCampaignId
+  ├── model/                       JPA entities, one per table
+  │   ├── Campaign                 id, name, clientCode, totalStock,
+  remainingStock, active
+  │   ├── Voucher                  id, campaignId, code, status(String),
+  redeemedBy, redeemedAt
+  │   └── Redemption               id(identity), voucherId, campaignId, userId,
+  createdAt
+  └── dto/                         response shapes
+      ├── RedeemResponse           {result: OK|FAILED, voucherCode,
+  remainingStock, message}
+      └── CampaignStats
+
+  Data model: campaign 1─* voucher, and redemption is an append-only log keyed
+  by voucher_id, campaign_id and user_id. Relations are plain Long ID fields
+  with no JPA annotations, and the schema has no foreign keys, unique
+  constraints or indexes.
+
+  3. Coding patterns (match these when you add code)
+
+  - Errors come back as values, not exceptions. A service returns
+    RedeemResponse.fail("reason") and the HTTP status is always 200, so callers
+    have to check result. There's no @ControllerAdvice. A new "limit exceeded"
+    rejection fits as one more RedeemResponse.fail(...).
+  - Statuses are strings ("ACTIVE", "REDEEMED", "VOID"), not an enum.
+  - Mixed dependency injection. VoucherController and VoucherService use field
+    @Autowired; CampaignController and CampaignStatsService use constructor
+    injection. You can see where different people have worked on it.
+  - Entities and DTOs are hand-written POJOs with getters and setters (no
+    Lombok, no records), and they use java.util.Date.
+  - There's no @Transactional anywhere.
+  - Repository lookups use Spring Data's derived query methods (method names
+    like findByCode); there's no custom SQL.
+
+  4. End-to-end flow: POST /vouchers/RAYA-0001/redeem?userId=user-1
+
+  Storefront ──HTTP──▶ DispatcherServlet ──▶ VoucherController.redeem(code,
+  userId)
+                                                 │
+                                                 ▼
+                                     VoucherService.redeem()
+     1. voucherRepository.findByCode(code)       → null?        → fail "Voucher
+  not found"
+     2. status == REDEEMED?                      → fail "Voucher already
+  redeemed"
+     3. status == VOID?                          → fail "Voucher is void"
+     4. campaignRepository.findById(..).get()
+     5. !campaign.active?                        → fail "Campaign is not active"
+     6. remainingStock <= 0?                     → fail "Campaign out of stock"
+     7. voucher → REDEEMED, redeemedBy, redeemedAt   → save
+     8. campaign.remainingStock - 1                  → save
+     9. new Redemption(voucherId, campaignId, userId) → save
+    10. auditClient.recordRedemption(...)  (synchronous, exception swallowed)
+    11. return RedeemResponse.ok(code, remainingStock)
+                                                 │
+  Storefront ◀── 200 JSON ── Jackson serializes RedeemResponse via its getters
+    {"result":"OK","voucherCode":"RAYA-0001","remainingStock":99,"message":null}
+
+  The other endpoints are simpler:
+  - Void: finds the voucher by code, sets status to VOID, saves and returns OK.
+    It doesn't check the current status, doesn't restore stock and doesn't touch
+    the redemption rows.
+  - Stats: loads the campaign, then runs one redemption query per voucher (an
+    N+1 pattern). It counts a voucher as "redeemed" if it has any redemption
+    row, and as "active" if its status is ACTIVE.
+
+  5. Where the limit belongs
+
+  The rule goes between steps 6 and 7 of VoucherService.redeem(). It needs four
+  things:
+  - A campaign column, for example max_redemptions_per_user INT NOT NULL DEFAULT
+    2, in schema.sql, plus a matching field on Campaign.
+  - A count query, for example
+    RedemptionRepository.countByCampaignIdAndUserId(...).
+  - A check that rejects the redemption once the count reaches the limit.
+  - A RedeemResponse.fail(...) with a clear message.
+
+  The trap in the seed data
+
+  user-99 has two redemption rows on campaign 1, but one of those vouchers
+  (RAYA-0005) is now VOID.
+  - If voided redemptions count, user-99 is already at the default limit of 2.
+  - If they don't, user-99 can redeem one more.
+
+  You need to decide this deliberately and write it down in NOTES.md. redemption
+  has no status column, so excluding voided ones means joining to voucher or
+  adding a status.
+
+  6. Problems I noticed (useful for NOTES.md and the recording)
+
+  Issue: Not atomic, no locking
+  Where: VoucherService.redeem
+  Notes: Nothing wraps the three saves in a transaction. The status and stock
+  checks are check-then-act, so two concurrent requests can double-redeem or
+  oversell. A per-user limit has the same race.
+  ────────────────────────────────────────
+  Issue: Running 3 instances
+  Where: –
+  Notes: H2 is in-memory and per-JVM, so each instance has its own database:
+  separate stock and redemption history, and the limit can be bypassed by
+  hitting a different instance. Even on a shared DB, the races above need row
+  locks, @Version, or an atomic UPDATE … WHERE remaining_stock > 0.
+  ────────────────────────────────────────
+  Issue: Hard-coded secret
+  Where: AuditClient
+  Notes: The API key is in source and sent in the request body. The URL is
+  hard-coded and RestTemplate has no timeouts, so a slow audit service blocks
+  redeem. The catch block logs no exception details.
+  ────────────────────────────────────────
+  Issue: Always HTTP 200
+  Where: controllers
+  Notes: Failures are only visible in the response body. findById().get() on an
+  unknown campaign ID returns a 500 with no clear message.
+  ────────────────────────────────────────
+  Issue: Void doesn't reconcile
+  Where: voidVoucher
+  Notes: Voiding a redeemed voucher doesn't restore stock, and the redemption
+  still counts in stats (and possibly against the limit). Any status can be
+  voided, with no authorization.
+  ────────────────────────────────────────
+  Issue: Schema
+  Where: schema.sql
+  Notes: voucher.code isn't unique, so findByCode throws if a code is
+  duplicated.
+  There are no foreign keys or indexes. The seed data shows remaining_stock 100
+   even though 2 vouchers are already used and only 6 exist.
+  ────────────────────────────────────────
+  Issue: Stats
+  Where: CampaignStatsService
+  Notes: N+1 queries, and voided vouchers count as "redeemed".
+  ────────────────────────────────────────
+  Issue: Tests
+  Where: VoucherServiceTest
+  Notes: All tests share one H2 context and change its data, so they depend on
+  run order. The tests also attempt real audit HTTP calls (which fail and get
+  swallowed). There's no test for void or stats.
+  ────────────────────────────────────────
+  Issue: Unused validation
+  Where: VoucherController
+  Notes: userId isn't validated, so an empty string is accepted.
+
+  If you want to keep the change proportionate to the 3–4 hour scope, I'd make
+  it:
+  1. The column with a default of 2.
+  2. The count query and the check.
+  3. A decision on voided redemptions.
+  4. @Transactional on redeem, with a note about locking.
+  5. Tests for at-limit and under-limit.
+
+  The rest of the table goes in NOTES.md as things you noticed but deliberately
+  didn't change. Tell me when you want to start implementing.
+
+> <ide_opened_file>The user opened the file
+  d:\projects\voucher-service-takehome\voucher-service-takehome\BRIEF.md in the
+  IDE. This may or may not be related to the current task.</ide_opened_file>
+
+> @voucher-service-takehome/voucher-service-takehome/BRIEF.md#15-23 this is the
+  task basically, can you tell me what you will do and give me a plan?
+
+● Here's what I'd do. There are two decisions I need from you, listed at the
+  end.
+
+  Design
+
+  1. Store the limit on the campaign.
+  - schema.sql: add max_redemptions_per_user INT NOT NULL DEFAULT 2 with a CHECK
+    (max_redemptions_per_user > 0). Existing campaigns get 2 automatically, so
+    data.sql doesn't need to change.
+  - Campaign.java: add the field, getter and setter, in the same style as the
+    other fields.
+  - Why here: the brief says "each campaign should define" its limit, so it
+    belongs to the campaign. A global config value can't vary per campaign. A
+    separate rules table would be too much for one number.
+
+  2. Count what the user has already redeemed in that campaign.
+  - Add one derived query in the existing style:
+    VoucherRepository.countByCampaignIdAndRedeemedByAndStatus(campaignId,
+    userId, "REDEEMED").
+  - This counts only redemptions that are still in effect. Because the
+    redemption table has no status column, it can't tell when a voucher was
+    later voided. The voucher table can.
+
+  3. Enforce it in VoucherService.redeem().
+  - Put the check after the active and stock checks and before any writes.
+  - Reject over-limit requests with a message in the existing format:
+    RedeemResponse.fail("User has reached the redemption limit (2) for this
+    campaign").
+  - Keep HTTP 200 + FAILED. Changing status codes would break the storefront's
+    existing contract. I'll mention the 200-for-errors issue in NOTES.md
+    instead.
+
+  4. Make it safe under concurrent requests.
+  - Without this, two parallel requests from the same user can both see "1 used"
+    and both succeed. That's the same race that already lets stock oversell.
+  - Fix: add @Transactional to redeem() and lock the campaign row with SELECT …
+    FOR UPDATE before checking. I'd add a findByIdForUpdate method to
+    CampaignRepository with @Lock(PESSIMISTIC_WRITE).
+  - After taking the lock, re-check the voucher's status. Otherwise two requests
+    for the same voucher could both pass.
+  - This makes redemptions within one campaign run one at a time. That's fine at
+    this scale, and it fixes the stock and duplicate-voucher races too, which
+    you can talk about in the recording.
+
+  5. Tests in VoucherServiceTest:
+  - A new user redeems 2 vouchers successfully, and the 3rd is rejected with the
+    limit message.
+  - user-99 (1 active redemption + 1 voided) can redeem one more.
+  - The limit applies per campaign: being at the limit in campaign 1 doesn't
+    block campaign 2.
+  - A campaign with a custom limit (for example 1) is respected.
+  - Test cleanup:
+    - Add @MockBean AuditClient so tests stop making real HTTP calls.
+    - Make each test roll back with @Transactional so the tests stop depending
+      on run order.
+  - Optional, if time allows: a concurrent test with 2 threads and the same user
+    at limit−1, where exactly one should succeed.
+
+  6. NOTES.md: what changed and why. Also what I saw but left alone:
+  - The hard-coded audit API key.
+  - voidVoucher not reconciling stock.
+  - The N+1 query in stats.
+  - The missing unique constraint on voucher.code.
+  - HTTP 200 for errors.
+  - The mixed injection styles.
+
+  For "next day": a Flyway migration, unique constraints, async/outbox for the
+  audit call, and exposing the limit in stats.
+
+  Commit order (the brief wants real history): schema and entity → repository
+  count + check → transaction/locking → tests → NOTES.md.
+
+  Out of scope: endpoints to change the limit, changes to the stats DTO, and
+  refactoring the code that's already there.
+
+  Decisions I need from you
+
+  1. Should voided redemptions count toward the limit? I recommend no: a voided
+     voucher is a cancelled redemption, so the user shouldn't lose a slot for
+     it. The opposite, stricter rule (count every redemption, voided or not)
+     also makes sense as protection against abuse. The seed data (user-99) looks
+     like it was set up to test exactly this. The brief invites you to email
+     them when something is unclear, so asking them is worthwhile, and you can
+     say so in NOTES.md.
+  2. Should I run ./gradlew test as I go, or do you want to run builds yourself?
+     For your other projects you've preferred to verify things yourself.
+
+  Once you confirm these, I'll start with step 1.
+
+> <ide_opened_file>The user opened the file d:\projects\voucher-service-takehom
+  e\voucher-service-takehome\voucher-service\src\main\resources\data.sql in the
+  IDE. This may or may not be related to the current task.</ide_opened_file>
+
+> The hard-coded audit API key.
+  voidVoucher not reconciling stock.
+  The N+1 query in stats.
+  The missing unique constraint on voucher.code.
+  HTTP 200 for errors.
+  The mixed injection styles.
+  can you explain this in more detail, which file and which line is it
+
+● Here's each one, with the exact lines and why it matters.
+
+  ---
+
+  1. Hard-coded audit API key
+
+  AuditClient.java:16-17 (voucher-service/src/main/java/com/prizm/campaign/servi
+  ce/AuditClient.java#L16-L17)
+  private static final String AUDIT_URL =
+  "http://internal-audit.prizm.local/api/v2/events";
+  private static final String API_KEY = "pzm_audit_7f3a91c4";
+  AuditClient.java:26 (voucher-service/src/main/java/com/prizm/campaign/service/
+  AuditClient.java#L26)
+  payload.put("apiKey", API_KEY);
+  Problems:
+  - The secret is committed to source, so anyone with repo access has it. It's
+    also in git history permanently: removing it later doesn't help, it has to
+    be rotated.
+  - The key is sent in the JSON body, not an auth header. Bodies are more likely
+    to end up in request logs.
+  - The URL is hard-coded, so dev, staging and prod can't point to different
+    audit services.
+  - new RestTemplate() on line 19 (voucher-service/src/main/java/com/prizm/campa
+    ign/service/AuditClient.java#L19) has no timeouts. Redeem calls audit
+    synchronously at VoucherService.java:71-75 (voucher-service/src/main/java/co
+    m/prizm/campaign/service/VoucherService.java#L71-L75), so a hanging audit
+    service hangs redemptions.
+  - The catch block there logs "audit call failed" without the exception, so you
+    can't tell why it failed.
+
+  Proper fix: move both values into application.yml as ${AUDIT_API_KEY}
+  environment placeholders, rotate the key, send it as a header, and configure
+  timeouts.
+
+  Why I'd leave it: it's unrelated to the feature, and rotating the key needs
+  the team that owns the audit service.
+
+  ---
+
+  2. voidVoucher doesn't reconcile stock
+
+  VoucherService.java:80-88 (voucher-service/src/main/java/com/prizm/campaign/se
+  rvice/VoucherService.java#L80-L88)
+  public RedeemResponse voidVoucher(String code) {
+      Voucher voucher = voucherRepository.findByCode(code);
+      if (voucher == null) { return RedeemResponse.fail("Voucher not found"); }
+      voucher.setStatus("VOID");
+      voucherRepository.save(voucher);
+      return RedeemResponse.ok(voucher.getCode(), null);
+  }
+  Problems:
+  - Voiding a REDEEMED voucher doesn't give back the stock taken by
+    remainingStock - 1 at line 64 (voucher-service/src/main/java/com/prizm/campa
+    ign/service/VoucherService.java#L64). remaining_stock drifts out of sync
+    with reality.
+  - The redemption row stays, and that table has no status column. Stats still
+    count the voucher as redeemed (see #3).
+  - There's no check on the current status. A voucher can be voided twice, and
+    an ACTIVE voucher can be voided without its stock changing either.
+  - Nothing records who voided it or why. There's no authorization check, and no
+    audit call.
+
+  The seed data shows the result: RAYA-0005 is VOID but still has redeemed_by =
+  'user-99' at data.sql:11 (voucher-service/src/main/resources/data.sql#L11) and
+  a redemption row at data.sql:19
+  (voucher-service/src/main/resources/data.sql#L19).
+
+  Why I'd leave it: what void means (refund? fraud cancel?) is a business
+  decision. Changing stock behaviour silently could break client reporting. This
+  is exactly why the limit counts voucher.status = 'REDEEMED' rather than rows
+  in redemption.
+
+  ---
+
+  3. N+1 query in stats
+
+  CampaignStatsService.java:32-44 (voucher-service/src/main/java/com/prizm/campa
+  ign/service/CampaignStatsService.java#L32-L44)
+  List<Voucher> vouchers = voucherRepository.findByCampaignId(campaignId);   //
+  1 query
+  for (Voucher v : vouchers) {
+      if (!redemptionRepository.findByVoucherId(v.getId()).isEmpty()) {      //
+  +1 query PER voucher
+          redeemed++;
+      }
+      ...
+  }
+  CampaignStatsService.java:56-61 (voucher-service/src/main/java/com/prizm/campa
+  ign/service/CampaignStatsService.java#L56-L61): getStatsForClient calls
+  getStats for each campaign, which multiplies it again.
+
+  Problems:
+  - A campaign with 100k vouchers means 100k+ queries per stats request. The
+    by-client endpoint is worse.
+  - It's also wrong: the redeemed count includes voided vouchers (#2). For
+    campaign 1 it reports 2 redeemed when only 1 is actually in effect.
+  - findById(campaignId).get() at line 30 (voucher-service/src/main/java/com/pri
+    zm/campaign/service/CampaignStatsService.java#L30) throws
+    NoSuchElementException for an unknown ID, which returns a 500.
+    VoucherService.java:49 (voucher-service/src/main/java/com/prizm/campaign/ser
+    vice/VoucherService.java#L49) has the same pattern.
+
+  Proper fix: a single COUNT ... GROUP BY query.
+
+  Why I'd leave it: it's a performance and correctness issue in a different
+  endpoint. Fixing it changes the numbers clients see, so it needs agreement
+  first.
+
+  ---
+
+  4. No unique constraint on voucher.code
+
+  schema.sql:14-21 (voucher-service/src/main/resources/schema.sql#L14-L21)
+  CREATE TABLE voucher (
+      id          BIGINT PRIMARY KEY,
+      campaign_id BIGINT       NOT NULL,
+      code        VARCHAR(40)  NOT NULL,   -- no UNIQUE
+      ...
+  );
+  VoucherRepository.java:10 (voucher-service/src/main/java/com/prizm/campaign/re
+  pository/VoucherRepository.java#L10)
+  Voucher findByCode(String code);   // assumes exactly one
+  Problems:
+  - If two vouchers share a code (for example two campaigns both issue
+    PROMO-0001), findByCode throws IncorrectResultSizeDataAccessException, so
+    every redeem or void of that code returns a 500.
+  - Without an index, every lookup by code scans the whole table.
+  - The schema also has no foreign keys (voucher.campaign_id,
+    redemption.voucher_id) and no index on redemption(campaign_id, user_id).
+
+  Proper fix: UNIQUE (code), or UNIQUE (campaign_id, code) if codes only need to
+  be unique per campaign. Which one depends on the business, and that affects
+  how the storefront looks codes up.
+
+  Why I'd leave it: adding a constraint to a production table means a migration
+  that can fail if duplicates already exist, so you check the data first. It's
+  also a business decision about code scope.
+
+  ---
+
+  5. HTTP 200 for errors
+
+  RedeemResponse.java:18-23 (voucher-service/src/main/java/com/prizm/campaign/dt
+  o/RedeemResponse.java#L18-L23)
+  public static RedeemResponse fail(String message) {
+      r.result = "FAILED";
+      r.message = message;
+  VoucherController.java:15-19 (voucher-service/src/main/java/com/prizm/campaign
+  /controller/VoucherController.java#L15-L19) returns the DTO directly, with no
+  ResponseEntity and no @ControllerAdvice.
+
+  Problems:
+  - "Voucher not found", "already redeemed", "out of stock" and now "limit
+    reached" all come back as 200 OK. Monitoring, load balancers and HTTP
+    clients all treat them as successes.
+  - The storefront has to match on the message string to tell the reasons apart.
+    There's no machine-readable error code, so rewording a message can break
+    callers.
+  - Meanwhile real crashes (.get() on an empty Optional) return a 500 with
+    Spring's default error body, which has a completely different shape.
+
+  Proper fix: 404, 409, 422 status codes plus an errorCode field.
+
+  Why I'd leave it: the storefront depends on this contract. Changing status
+  codes is a breaking API change and needs coordinating with every client. The
+  new limit failure follows the existing pattern so it doesn't break anyone.
+
+  ---
+
+  6. Mixed injection styles
+
+  Field injection:
+  - VoucherController.java:12-13 (voucher-service/src/main/java/com/prizm/campai
+    gn/controller/VoucherController.java#L12-L13)
+  - VoucherService.java:22-32 (voucher-service/src/main/java/com/prizm/campaign/
+    service/VoucherService.java#L22-L32)
+  @Autowired
+  private VoucherRepository voucherRepository;
+  Constructor injection:
+  - CampaignController.java:13-17 (voucher-service/src/main/java/com/prizm/campa
+    ign/controller/CampaignController.java#L13-L17)
+  - CampaignStatsService.java:17-27 (voucher-service/src/main/java/com/prizm/cam
+    paign/service/CampaignStatsService.java#L17-L27)
+  private final CampaignRepository campaignRepository;
+  public CampaignStatsService(CampaignRepository campaignRepository, ...) { ...
+  }
+  Problems:
+  - Field injection hides a class's dependencies and makes the fields mutable.
+  - You can't unit-test VoucherService with plain new VoucherService(mocks); you
+    need Spring or reflection. That's one reason the only tests are slow
+    @SpringBootTest ones.
+  - Constructor injection is what Spring recommends.
+  - Mostly it shows different people wrote different parts, which is what the
+    brief means by "worked on by several people".
+
+  Why I'd leave it: it's purely cosmetic and the code works. Converting
+  VoucherService would add noise to the diff of the class I'm actually changing,
+  and make the reviewer's job harder. I'd follow the existing field style in
+  that class and note it for a separate refactor.
+
+  ---
+
+  For your recording, #2 is the strongest example of something you'd change but
+  deliberately didn't. It's directly connected to your feature (it's why you
+  count by voucher status), and fixing it means deciding what void means for the
+  business. That's not a call to make alone in a take-home.
+
+> <ide_opened_file>The user opened the file
+  d:\projects\voucher-service-takehome\voucher-service-takehome\BRIEF.md in the
+  IDE. This may or may not be related to the current task.</ide_opened_file>
+
+> Should voided redemptions count toward the limit? stick with the opposite, as
+  it is part of the redemptions too.
+
+  Should I run ./gradlew test as I go, or do you want to run builds yourself?
+  run myself.
+
+  Also, can you also fix the issue below:
+  1. The hard-coded audit API key. Put create an .env and put the key inside
+  it.
+
+  once you fix the issue and implemented the changes, can you create the
+  notes.md for me and write point forms about the changes and why, also mention
+  the 2. voidVoucher doesn't reconcile stock (requires business deicion), 3.
+  N+1 query in stats (discussion with clients on their needs), 4. No unique
+  constraint on (check on business whether the coupon is unique), 5. HTTP 200
+  for errors (required discussion as this is API design related), 6. Mixed
+  injection styles (if alignment required, then need to have coding style
+  discussion with team, but now no need to change if it not part of the
+  requirement now). All these noticed but did not change write in point form
+  and the bracket of my reasoning (i will add more later).
+
+  Also write in short sentence that if i had another day, i will email and
+  request for more business information and add extra more audit log from the
+  start of the function and success on the function.
+
+  Read 11 files, ran 1 shell command (ctrl+o to expand)
+
+● The schema now uses SQL Server syntax (BIT, datetime2, IDENTITY(1,1)), which
+  wasn't there when I first read it. I'll check whether the rest of the setup
+  changed as well.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● There's now a git repo in voucher-service/, and data.sql changed as well. Let
+  me look at the history.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● You've already converted the schema to SQL Server syntax in commit 8519451, so
+  my schema change will use syntax that works in SQL Server too. Making the
+  edits now:
+
+● Update(src\main\resources\schema.sql)
+  ⎿  Added 2 lines, removed 1 line
+       8      client_code     VARCHAR(50)  NOT NULL,
+       9      total_stock     INT          NOT NULL,
+      10      remaining_stock INT          NOT NULL,
+      11 -    active          BIT      NOT NULL DEFAULT 1                
+      11 +    active          BIT      NOT NULL DEFAULT 1,               
+      12 +    max_redemptions_per_user INT NOT NULL DEFAULT 2 CHECK (max_
+         +redemptions_per_user > 0)                                      
+      13  );
+      14  
+      15  CREATE TABLE voucher (
+
+● Update(src\main\java\com\prizm\campaign\model\Campaign.java)
+  ⎿  Added 3 lines
+      22  
+      23      private boolean active;
+      24  
+      25 +    @Column(name = "max_redemptions_per_user")                 
+      26 +    private int maxRedemptionsPerUser;                         
+      27 +                                                               
+      28      public Long getId() { return id; }
+      29      public void setId(Long id) { this.id = id; }
+      30      public String getName() { return name; }
+
+● Update(src\main\java\com\prizm\campaign\model\Campaign.java)
+  ⎿  Added 2 lines
+      37      public void setRemainingStock(int remainingStock) { this.re
+          mainingStock = remainingStock; }
+      38      public boolean isActive() { return active; }
+      39      public void setActive(boolean active) { this.active = activ
+          e; }
+      40 +    public int getMaxRedemptionsPerUser() { return maxRedemptio
+         +nsPerUser; }                                                   
+      41 +    public void setMaxRedemptionsPerUser(int maxRedemptionsPerU
+         +ser) { this.maxRedemptionsPerUser = maxRedemptionsPerUser; }   
+      42  }
+
+● Update(src\main\java\com\prizm\campaign\repository\RedemptionRepository.java)
+  ⎿  Added 3 lines
+      10      List<Redemption> findByVoucherId(Long voucherId);
+      11  
+      12      List<Redemption> findByCampaignId(Long campaignId);
+      13 +                                                               
+      14 +    // Counts every redemption row, including ones whose vouche
+         +r was later voided.                                            
+      15 +    long countByCampaignIdAndUserId(Long campaignId, String use
+         +rId);                                                          
+      16  }
+
+● Write(src\main\java\com\prizm\campaign\repository\CampaignRepository.java)
+  ⎿  Added 11 lines
+       1  package com.prizm.campaign.repository;
+       2  
+       3  import com.prizm.campaign.model.Campaign;
+       4 +import jakarta.persistence.LockModeType;                       
+       5  import org.springframework.data.jpa.repository.JpaRepository;
+       6 +import org.springframework.data.jpa.repository.Lock;           
+       7 +import org.springframework.data.jpa.repository.Query;          
+       8 +import org.springframework.data.repository.query.Param;        
+       9  
+      10  import java.util.List;
+      11 +import java.util.Optional;                                     
+      12  
+      13  public interface CampaignRepository extends JpaRepository<Campa
+          ign, Long> {
+      14  
+      15      List<Campaign> findByClientCode(String clientCode);
+      16 +                                                               
+      17 +    // Row lock so concurrent redemptions in the same campaign 
+         +are serialised                                                 
+      18 +    // (stock decrement + per-user limit check).               
+      19 +    @Lock(LockModeType.PESSIMISTIC_WRITE)                      
+      20 +    @Query("select c from Campaign c where c.id = :id")        
+      21 +    Optional<Campaign> findByIdForUpdate(@Param("id") Long id);
+      22  }
+
+● Write(src\main\java\com\prizm\campaign\repository\VoucherRepository.java)
+  ⎿  Added 9 lines
+       1  package com.prizm.campaign.repository;
+       2  
+       3  import com.prizm.campaign.model.Voucher;
+       4 +import jakarta.persistence.LockModeType;                       
+       5  import org.springframework.data.jpa.repository.JpaRepository;
+       6 +import org.springframework.data.jpa.repository.Lock;           
+       7 +import org.springframework.data.jpa.repository.Query;          
+       8 +import org.springframework.data.repository.query.Param;        
+       9  
+      10  import java.util.List;
+      11  
+     ...
+      13  
+      14      Voucher findByCode(String code);
+      15  
+      16 +    // Row lock so the same voucher can't be redeemed twice by 
+         +concurrent requests.                                           
+      17 +    @Lock(LockModeType.PESSIMISTIC_WRITE)                      
+      18 +    @Query("select v from Voucher v where v.code = :code")     
+      19 +    Voucher findByCodeForUpdate(@Param("code") String code);   
+      20 +                                                               
+      21      List<Voucher> findByCampaignId(Long campaignId);
+      22  }
+
+● Update(src\main\java\com\prizm\campaign\service\VoucherService.java)
+  ⎿  Added 3 lines, removed 1 line
+      31      @Autowired
+      32      private AuditClient auditClient;
+      33  
+      34 +    // Locks are always taken voucher -> campaign to avoid dead
+         +locks.                                                         
+      35 +    @Transactional                                             
+      36      public RedeemResponse redeem(String code, String userId) {
+      37  
+      36 -        Voucher voucher = voucherRepository.findByCode(code);  
+      38 +        Voucher voucher = voucherRepository.findByCodeForUpdate
+         +(code);                                                        
+      39          if (voucher == null) {
+      40              return RedeemResponse.fail("Voucher not found");
+      41          }
+
+● Update(src\main\java\com\prizm\campaign\service\VoucherService.java)
+  ⎿  Added 7 lines, removed 1 line
+      48              return RedeemResponse.fail("Voucher is void");
+      49          }
+      50  
+      51 -        Campaign campaign = campaignRepository.findById(voucher
+         -.getCampaignId()).get();                                       
+      51 +        Campaign campaign = campaignRepository.findByIdForUpdat
+         +e(voucher.getCampaignId()).get();                              
+      52  
+      53          if (!campaign.isActive()) {
+      54              return RedeemResponse.fail("Campaign is not active"
+          );
+     ...
+      58              return RedeemResponse.fail("Campaign out of stock")
+          ;
+      59          }
+      60  
+      61 +        long userRedemptions = redemptionRepository.countByCamp
+         +aignIdAndUserId(campaign.getId(), userId);                     
+      62 +        if (userRedemptions >= campaign.getMaxRedemptionsPerUse
+         +r()) {                                                         
+      63 +            return RedeemResponse.fail("Redemption limit reache
+         +d: a user may redeem at most "                                 
+      64 +                    + campaign.getMaxRedemptionsPerUser() + " v
+         +oucher(s) in this campaign");                                  
+      65 +        }                                                      
+      66 +                                                               
+      67          voucher.setStatus("REDEEMED");
+      68          voucher.setRedeemedBy(userId);
+      69          voucher.setRedeemedAt(new Date());
+
+● Update(src\main\java\com\prizm\campaign\service\VoucherService.java)
+  ⎿  Added 1 line
+      11  import org.slf4j.LoggerFactory;
+      12  import org.springframework.beans.factory.annotation.Autowired;
+      13  import org.springframework.stereotype.Service;
+      14 +import org.springframework.transaction.annotation.Transactional
+         +;                                                              
+      15  
+      16  import java.util.Date;
+      17  
+● Write(src\main\java\com\prizm\campaign\service\AuditClient.java)
+  ⎿  Added 6 lines, removed 2 lines
+      2  
+      3  import org.slf4j.Logger;
+      4  import org.slf4j.LoggerFactory;
+      5 +import org.springframework.beans.factory.annotation.Value;      
+      6  import org.springframework.stereotype.Component;
+      7  import org.springframework.web.client.RestTemplate;
+      8  
+     ...
+      15      private static final Logger log = LoggerFactory.getLogger(A
+          uditClient.class);
+      16  
+      17      private static final String AUDIT_URL = "http://internal-au
+          dit.prizm.local/api/v2/events";
+      17 -    private static final String API_KEY = "pzm_audit_7f3a91c4";
+      18  
+      19 +    // Loaded from AUDIT_API_KEY (.env file or environment vari
+         +able), see application.yml.                                    
+      20 +    @Value("${audit.api-key}")                                 
+      21 +    private String apiKey;                                     
+      22 +                                                               
+      23      private final RestTemplate restTemplate = new RestTemplate(
+          );
+      24  
+      25      public void recordRedemption(String clientCode, String vouc
+          herCode, String userId) {
+     ...
+      27          payload.put("clientCode", clientCode);
+      28          payload.put("voucherCode", voucherCode);
+      29          payload.put("userId", userId);
+      26 -        payload.put("apiKey", API_KEY);                        
+      30 +        payload.put("apiKey", apiKey);                         
+      31  
+      32          restTemplate.postForObject(AUDIT_URL, payload, String.c
+          lass);
+      33          log.info("audit event sent for {}", voucherCode);
+
+● Update(src\main\resources\application.yml)
+  ⎿  Added 3 lines
+      1  spring:
+      2 +  config:                                                       
+      3 +    # Local secrets (not committed). Real environments set AUDIT
+        +_API_KEY as an env var instead.                                 
+      4 +    import: optional:file:.env[.properties]                     
+      5    datasource:
+      6      url: jdbc:h2:mem:campaigndb;DB_CLOSE_DELAY=-1
+      7      username: sa
+
+● Update(src\main\resources\application.yml)
+  ⎿  Added 3 lines
+      17  server:
+      18    port: 8080
+      19  
+      20 +audit:                                                         
+      21 +  api-key: ${AUDIT_API_KEY}                                    
+      22 +                                                               
+      23  logging:
+      24    level:
+      25      com.prizm.campaign: INFO
+
+● Write(.env)
+  ⎿  Wrote 1 line to .env
+      1 AUDIT_API_KEY=pzm_audit_7f3a91c4
+
+● Write(.env.example)
+  ⎿  Wrote 1 line to .env.example
+      1 AUDIT_API_KEY=changeme
+
+● Update(.gitignore)
+  ⎿  Added 1 line
+      3  *.class
+      4  .idea/
+      5  *.iml
+      6 +.env                                                            
+
+● Update(README.md)
+  ⎿  Added 3 lines
+       8  ## Running
+       9  
+      10  ```
+      11 +cp .env.example .env    # then set AUDIT_API_KEY               
+      12  ./gradlew bootRun
+      13  ```
+      14  
+      15 +`AUDIT_API_KEY` can also be supplied as an environment variable
+         + instead of `.env`.                                            
+      16 +                                                               
+      17  H2 in-memory DB, seeded from `src/main/resources/schema.sql` + 
+          `data.sql` on startup.
+      18  
+      19  ## Endpoints
+
+● Update(README.md)
+  ⎿  Added 6 lines
+      33  
+      34  `user-99` already has redemption history on campaign 1.
+      35  
+      36 +## Per-user redemption limit                                   
+      37 +                                                               
+      38 +Each campaign has `max_redemptions_per_user` (default `2`). Eve
+         +ry redemption row counts                                       
+      39 +towards the limit, including ones whose voucher was later voide
+         +d — so `user-99` is already                                    
+      40 +at the limit on campaign 1.                                    
+      41 +                                                               
+      42  ## Tests
+      43  
+      44  ```
+
+● Write(src\test\java\com\prizm\campaign\VoucherServiceTest.java)
+  ⎿  Added 64 lines
+       1  package com.prizm.campaign;
+       2  
+       3  import com.prizm.campaign.dto.RedeemResponse;
+       4 +import com.prizm.campaign.model.Campaign;                      
+       5 +import com.prizm.campaign.repository.CampaignRepository;       
+       6 +import com.prizm.campaign.service.AuditClient;                 
+       7  import com.prizm.campaign.service.VoucherService;
+       8  import org.junit.jupiter.api.Test;
+       9  import org.springframework.beans.factory.annotation.Autowired;
+      10  import org.springframework.boot.test.context.SpringBootTest;
+      11 +import org.springframework.boot.test.mock.mockito.MockBean;    
+      12 +import org.springframework.transaction.annotation.Transactional
+         +;                                                              
+      13  
+      14  import static org.junit.jupiter.api.Assertions.assertEquals;
+      15 +import static org.junit.jupiter.api.Assertions.assertTrue;     
+      16  
+      17 +// @Transactional rolls each test back so tests don't leak rede
+         +mptions into each other.                                       
+      18  @SpringBootTest
+      19 +@Transactional                                                 
+      20  class VoucherServiceTest {
+      21  
+      22      @Autowired
+      23      private VoucherService voucherService;
+      24  
+      25 +    @Autowired                                                 
+      26 +    private CampaignRepository campaignRepository;             
+      27 +                                                               
+      28 +    // Stops tests from calling the real audit service.        
+      29 +    @MockBean                                                  
+      30 +    private AuditClient auditClient;                           
+      31 +                                                               
+      32      @Test
+      33      void redeemActiveVoucherSucceeds() {
+      34          RedeemResponse res = voucherService.redeem("RAYA-0001",
+           "user-1");
+     ...
+      46          RedeemResponse res = voucherService.redeem("NOPE-9999",
+           "user-3");
+      47          assertEquals("FAILED", res.getResult());
+      48      }
+      49 +                                                               
+      50 +    @Test                                                      
+      51 +    void userCanRedeemUpToDefaultLimitThenIsRejected() {       
+      52 +        assertEquals("OK", voucherService.redeem("RAYA-0001", "
+         +user-1").getResult());                                         
+      53 +        assertEquals("OK", voucherService.redeem("RAYA-0002", "
+         +user-1").getResult());                                         
+      54 +                                                               
+      55 +        RedeemResponse third = voucherService.redeem("RAYA-0003
+         +", "user-1");                                                  
+      56 +        assertEquals("FAILED", third.getResult());             
+      57 +        assertTrue(third.getMessage().contains("Redemption limi
+         +t reached"));                                                  
+      58 +    }                                                          
+      59 +                                                               
+      60 +    @Test                                                      
+      61 +    void voidedRedemptionsCountTowardsLimit() {                
+      62 +        // user-99 has one REDEEMED and one VOID redemption on 
+         +campaign 1 -> already at limit 2                               
+      63 +        RedeemResponse res = voucherService.redeem("RAYA-0001",
+         + "user-99");                                                   
+      64 +        assertEquals("FAILED", res.getResult());               
+      65 +        assertTrue(res.getMessage().contains("Redemption limit 
+         +reached"));                                                    
+      66 +    }                                                          
+      67 +                                                               
+      68 +    @Test                                                      
+      69 +    void limitIsPerCampaign() {                                
+      70 +        // user-99 is at the limit on campaign 1 but has no his
+         +tory on campaign 2                                             
+      71 +        RedeemResponse res = voucherService.redeem("MRDK-0001",
+         + "user-99");                                                   
+      72 +        assertEquals("OK", res.getResult());                   
+      73 +    }                                                          
+      74 +                                                               
+      75 +    @Test                                                      
+      76 +    void customCampaignLimitIsRespected() {                    
+      77 +        Campaign campaign = campaignRepository.findById(2L).get
+         +();                                                            
+      78 +        campaign.setMaxRedemptionsPerUser(1);                  
+      79 +        campaignRepository.save(campaign);                     
+      80 +                                                               
+      81 +        assertEquals("OK", voucherService.redeem("MRDK-0001", "
+         +user-5").getResult());                                         
+      82 +                                                               
+      83 +        RedeemResponse second = voucherService.redeem("MRDK-000
+         +2", "user-5");                                                 
+      84 +        assertEquals("FAILED", second.getResult());            
+      85 +        assertTrue(second.getMessage().contains("at most 1")); 
+      86 +    }                                                          
+      87 +                                                               
+      88 +    @Test                                                      
+      89 +    void rejectedRedemptionDoesNotConsumeStockOrVoucher() {    
+      90 +        int stockBefore = campaignRepository.findById(1L).get()
+         +.getRemainingStock();                                          
+      91 +                                                               
+      92 +        assertEquals("FAILED", voucherService.redeem("RAYA-0001
+         +", "user-99").getResult());                                    
+      93 +                                                               
+      94 +        assertEquals(stockBefore, campaignRepository.findById(1
+         +L).get().getRemainingStock());                                 
+      95 +        // voucher is still ACTIVE, so another user can redeem 
+         +it                                                             
+      96 +        assertEquals("OK", voucherService.redeem("RAYA-0001", "
+         +user-7").getResult());                                         
+      97 +    }                                                          
+      98  }
+
+● Now NOTES.md. It goes at the git repo root (voucher-service/) so it ends up in
+  the repository you submit.
+
+● Write(NOTES.md)
+  ⎿  Wrote 59 lines to NOTES.md
+       1 # NOTES
+       3 ## What I changed and why
+       4
+       6 - **New column `campaign.max_redemptions_per_user`** (`INT NOT N
+         n`.
+       7   - The brief says each campaign defines its own limit, so it li
+       8   - `DEFAULT 2` gives every existing campaign the required defau
+         lt without touching seed data.
+         ilently blocking every user.
+         how many times the user has redeemed in that campaign.
+     … +94 lines (ctrl+o to expand)
+
+● I've added the per-user limit, moved the audit key into .env, and written
+  NOTES.md. Nothing has been compiled or run yet; I've left ./gradlew test to
+  you as you asked.
+
+  Per-user limit
+  - Where it's stored: a new max_redemptions_per_user INT NOT NULL DEFAULT 2
+    column in schema.sql (src/main/resources/schema.sql#L12), mapped on
+    Campaign.java (src/main/java/com/prizm/campaign/model/Campaign.java). The
+    CHECK (> 0) constraint uses syntax that also works on SQL Server, to fit
+    your MSSQL conversion.
+  - Counting: countByCampaignIdAndUserId in RedemptionRepository.java
+    (src/main/java/com/prizm/campaign/repository/RedemptionRepository.java)
+    counts every redemption row, voided ones included, as you chose. That puts
+    user-99 at the limit on campaign 1.
+  - The check: it's in VoucherService.java
+    (src/main/java/com/prizm/campaign/service/VoucherService.java), after the
+    active and stock checks. An over-limit request gets FAILED with Redemption
+    limit reached: a user may redeem at most N voucher(s) in this campaign.
+  - Concurrent requests: redeem() is now @Transactional and locks the voucher
+    row, then the campaign row. This closes the gap where two simultaneous
+    requests could both get past the limit (and the old double-redeem and
+    oversell races).
+
+  Audit key
+  - AuditClient.java (src/main/java/com/prizm/campaign/service/AuditClient.java)
+    now reads the key from ${audit.api-key}, which application.yml
+    (src/main/resources/application.yml) fills from AUDIT_API_KEY.
+  - That value comes from .env, loaded through spring.config.import. .env is
+    git-ignored, and there's a committed .env.example plus a setup step in the
+    README.
+  - Because .env isn't committed, anyone cloning the repo has to copy
+    .env.example to .env (or set the environment variable) before bootRun will
+    start.
+  - The old key is still in your commit history, so NOTES.md says it should be
+    rotated.
+
+  Tests: VoucherServiceTest.java
+  (src/test/java/com/prizm/campaign/VoucherServiceTest.java) has 5 new limit
+  tests. Each test now rolls back, and AuditClient is mocked so tests make no
+  network calls.
+
+  NOTES.md has the changes and reasons, your 5 noticed-but-not-changed items
+  with your reasoning in brackets, and the "another day" lines. I left the three
+  reflection answers as TODO for you. One idea for "which AI suggestion did you
+  reject": I recommended that voided redemptions shouldn't count, and you went
+  the other way.
+
+  Decision for you: the audit HTTP call still runs inside the transaction, so it
+  holds the locks while it runs. It has no timeout, so a slow audit service
+  would hold up every redemption in that campaign. I left it because changing it
+  is beyond what you asked. Moving the call to after the commit is about 8
+  lines, or it can go in NOTES.md as a "next day" item. Which do you want?
+
+  I haven't committed anything. The brief wants your real history, so suggested
+  commits are:
+  1. Schema and entity.
+  2. Limit check.
+  3. Locking.
+  4. Audit key to .env.
+  5. Tests.
+  6. NOTES.md.
+
+> <ide_opened_file>The user opened the file d:\projects\voucher-service-takehom
+  e\voucher-service-takehome\voucher-service\NOTES.md in the IDE. This may or
+  may not be related to the current task.</ide_opened_file>
+
+> Decision for you: the audit HTTP call still runs inside the transaction, so
+  it holds the locks while it runs. It has no timeout, so a slow audit service
+  would hold up every redemption in that campaign. I left it because changing
+  it is beyond what you asked. Moving the call to after the commit is about 8
+  lines, or it can go in NOTES.md as a "next day" item. Which do you want?
+
+  make it next day
+
+● Update(NOTES.md)
+  ⎿  Added 1 line
+      49  ## If I had another day
+      50  - Email the team to ask for more business details on the open q
+          uestions above (void semantics, code uniqueness, what the stats
+           should show).
+      51  - Add more audit logging: log at the start of `redeem()` (reque
+          st received) and on success, as well as on failure.
+      52 +- Move the audit HTTP call so it runs after the transaction com
+         +mits, and give `RestTemplate` timeouts. Right now it runs insid
+         +e the transaction with no timeout, so a slow audit service keep
+         +s the voucher and campaign row locks held and blocks every othe
+         +r redemption in that campaign.                                 
+      53  
+      54  ## Reflections
+      55  - **What did you get wrong first, and how did you notice?**
+
+● The audit call stays as it is; I added it to the "If I had another day"
+  section of NOTES.md. The entry says I'd move the call so it runs after the
+  transaction commits and give it timeouts. It also gives the reason: at the
+  moment a slow audit service keeps the locks held and blocks every other
+  redemption in that campaign.
+
+> <ide_opened_file>The user opened the file
+  d:\projects\voucher-service-takehome\voucher-service-takehome\BRIEF.md in the
+  IDE. This may or may not be related to the current task.</ide_opened_file>
+
+> Should I run ./gradlew test as I go, or do you want to run builds yourself?
+  For your other projects you've preferred to verify things yourself.
+
+  for this, can you run yourself and tell me the test result as i dont have
+  java install in my this pc
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Java isn't installed on this PC. I'll download a portable Eclipse Temurin JDK
+  17 zip into the scratchpad and use it just for this test run, avoiding a
+  system-wide install.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● It compiled, but the H2 schema script failed when the Spring context started.
+  Let me find the exact statement that failed.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The tests never ran — Spring failed to start because H2 rejects the SQL Server
+  syntax BIGINT IDENTITY(1,1) in the redemption table, which stems from the
+  MSSQL conversion commit, not the limit change (my new campaign column created
+  fine). I'll rerun the tests with H2's SQL Server compatibility mode enabled
+  via an environment variable to confirm this, without editing any files.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The tests pass, but only with a setting that isn't in your config yet. With
+  your current config every test fails, because the app can't start.
+
+  As committed: 0 of 8 pass.
+  - H2 can't create the database. It rejects id BIGINT IDENTITY(1,1) in the
+    redemption table of schema.sql.
+  - That syntax came from your SQL Server conversion commit (8519451), not from
+    the limit change. The campaign table with the new limit column was created
+    fine.
+  - ./gradlew bootRun would fail the same way.
+
+  With H2's SQL Server compatibility mode on: 8 of 8 pass. I turned it on just
+  for this run with an environment variable (MODE=MSSQLServer on the database
+  URL) and changed no files.
+
+  ┌────────────────────────────────────────────────┬────────┐
+  │                      Test                      │ Result │
+  ├────────────────────────────────────────────────┼────────┤
+  │ redeemActiveVoucherSucceeds                    │ ✅     │
+  ├────────────────────────────────────────────────┼────────┤
+  │ redeemAlreadyRedeemedVoucherFails              │ ✅     │
+  ├────────────────────────────────────────────────┼────────┤
+  │ redeemUnknownCodeFails                         │ ✅     │
+  ├────────────────────────────────────────────────┼────────┤
+  │ userCanRedeemUpToDefaultLimitThenIsRejected    │ ✅     │
+  ├────────────────────────────────────────────────┼────────┤
+  │ voidedRedemptionsCountTowardsLimit             │ ✅     │
+  ├────────────────────────────────────────────────┼────────┤
+  │ limitIsPerCampaign                             │ ✅     │
+  ├────────────────────────────────────────────────┼────────┤
+  │ customCampaignLimitIsRespected                 │ ✅     │
+  ├────────────────────────────────────────────────┼────────┤
+  │ rejectedRedemptionDoesNotConsumeStockOrVoucher │ ✅     │
+  └────────────────────────────────────────────────┴────────┘
+
+  Decision for you: how should the repo handle this permanently?
+  - My recommendation: add ;MODE=MSSQLServer to the database URL in
+    application.yml (src/main/resources/application.yml#L6). It's a one-line
+    change that keeps your SQL Server scripts, and the app and tests would start
+    for whoever reviews it.
+  - The alternative: revert schema.sql and data.sql to H2 syntax, for example
+    BIGINT AUTO_INCREMENT.
+
+  Say which and I'll make the change and rerun the tests.
+
+  Java still isn't installed on your PC. I downloaded a portable JDK 17 into
+  this session's temporary scratchpad (C:\Users\AIDENT~1\AppData\Local\Temp\clau
+  de\d--projects\1495884c-5be2-4659-9799-bb0fd5e4f440\scratchpad\jdk) and used
+  it only for these test runs.
+
+> <ide_opened_file>The user opened the file d:\projects\voucher-service-takehom
+  e\voucher-service-takehome\voucher-service\src\main\resources\schema.sql in
+  the IDE. This may or may not be related to the current
+  task.</ide_opened_file>
+
+> The alternative: revert schema.sql and data.sql to H2 syntax, for example
+  BIGINT AUTO_INCREMENT
+
+  revert it
+
+  Read 2 files (ctrl+o to expand)
+● I'm putting back the original H2 column types and keeping the new
+  max_redemptions_per_user column.
+
+● Write(src\main\resources\schema.sql)
+  ⎿  Added 4 lines, removed 4 lines
+       8      client_code     VARCHAR(50)  NOT NULL,
+       9      total_stock     INT          NOT NULL,
+      10      remaining_stock INT          NOT NULL,
+      11 -    active          BIT      NOT NULL DEFAULT 1,               
+      11 +    active          BOOLEAN      NOT NULL DEFAULT TRUE,        
+      12      max_redemptions_per_user INT NOT NULL DEFAULT 2 CHECK (max_
+          redemptions_per_user > 0)
+      13  );
+      14  
+     ...
+      18      code        VARCHAR(40)  NOT NULL,
+      19      status      VARCHAR(20)  NOT NULL,
+      20      redeemed_by VARCHAR(80),
+      21 -    redeemed_at datetime2                                      
+      21 +    redeemed_at TIMESTAMP                                      
+      22  );
+      23  
+      24  CREATE TABLE redemption (
+      25 -    id          BIGINT IDENTITY(1,1) PRIMARY KEY,              
+      25 +    id          BIGINT AUTO_INCREMENT PRIMARY KEY,             
+      26      voucher_id  BIGINT      NOT NULL,
+      27      campaign_id BIGINT      NOT NULL,
+      28      user_id     VARCHAR(80) NOT NULL,
+      29 -    created_at  datetime2   NOT NULL                           
+      29 +    created_at  TIMESTAMP   NOT NULL                           
+      30  );
+
+● Update(src\main\resources\data.sql)
+  ⎿  Added 3 lines, removed 3 lines
+      1  INSERT INTO campaign (id, name, client_code, total_stock, remain
+         ing_stock, active) VALUES
+      2 -  (1, 'Raya Flash Deal', 'ACME', 100, 100, 1),                  
+      3 -  (2, 'Merdeka Giveaway', 'NOVA', 50, 50, 1),                   
+      4 -  (3, 'Expired Test Campaign', 'ACME', 10, 0, 0);               
+      2 +  (1, 'Raya Flash Deal', 'ACME', 100, 100, TRUE),               
+      3 +  (2, 'Merdeka Giveaway', 'NOVA', 50, 50, TRUE),                
+      4 +  (3, 'Expired Test Campaign', 'ACME', 10, 0, FALSE);           
+      5  
+      6  INSERT INTO voucher (id, campaign_id, code, status, redeemed_by,
+          redeemed_at) VALUES
+      7    (1, 1, 'RAYA-0001', 'ACTIVE',   NULL,      NULL),
+
+● Now rerunning the tests with the plain config, without the compatibility-mode
+  variable:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I've switched schema.sql (src/main/resources/schema.sql) and data.sql
+  (src/main/resources/data.sql) back to H2 syntax, and all 8 tests now pass with
+  the normal config. No special settings or environment variables are needed.
+
+  - schema.sql: BIT/DEFAULT 1 is back to BOOLEAN/DEFAULT TRUE, datetime2 is back
+    to TIMESTAMP, and IDENTITY(1,1) is back to AUTO_INCREMENT. The new
+    max_redemptions_per_user INT NOT NULL DEFAULT 2 CHECK (...) column is still
+    there.
+  - data.sql: the campaign active values are TRUE/FALSE again instead of 1/0.
+    The rest of the seed data was already the same.
+
+  These files now match what the brief shipped, plus the new column. Your SQL
+  Server version is still in your commit history if you want it later.
+
+  I haven't committed anything. When you commit, a message like "revert
+  schema/data to H2 syntax so the service starts" would explain the change in
+  your history.

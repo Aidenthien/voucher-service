@@ -11,6 +11,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Date;
 
@@ -31,9 +32,11 @@ public class VoucherService {
     @Autowired
     private AuditClient auditClient;
 
+    // Locks are always taken voucher -> campaign to avoid deadlocks.
+    @Transactional
     public RedeemResponse redeem(String code, String userId) {
 
-        Voucher voucher = voucherRepository.findByCode(code);
+        Voucher voucher = voucherRepository.findByCodeForUpdate(code);
         if (voucher == null) {
             return RedeemResponse.fail("Voucher not found");
         }
@@ -46,7 +49,7 @@ public class VoucherService {
             return RedeemResponse.fail("Voucher is void");
         }
 
-        Campaign campaign = campaignRepository.findById(voucher.getCampaignId()).get();
+        Campaign campaign = campaignRepository.findByIdForUpdate(voucher.getCampaignId()).get();
 
         if (!campaign.isActive()) {
             return RedeemResponse.fail("Campaign is not active");
@@ -54,6 +57,11 @@ public class VoucherService {
 
         if (campaign.getRemainingStock() <= 0) {
             return RedeemResponse.fail("Campaign out of stock");
+        }
+
+        long userRedemptions = redemptionRepository.countByCampaignIdAndUserId(campaign.getId(), userId);
+        if (userRedemptions >= campaign.getMaxRedemptionsPerUser()) {
+            return RedeemResponse.fail("Redemption limit reached: a user may redeem at most " + campaign.getMaxRedemptionsPerUser() + " voucher(s) in this campaign");
         }
 
         voucher.setStatus("REDEEMED");

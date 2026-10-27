@@ -1,4 +1,7 @@
 spring:
+  config:
+    # Local secrets (not committed). Real environments set AUDIT_API_KEY as an env var instead.
+    import: optional:file:.env[.properties]
   datasource:
     url: jdbc:h2:mem:campaigndb;DB_CLOSE_DELAY=-1
     username: sa
@@ -13,6 +16,9 @@ spring:
 
 server:
   port: 8080
+
+audit:
+  api-key: ${AUDIT_API_KEY}
 
 logging:
   level:
