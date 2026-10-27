@@ -1,7 +1,7 @@
 INSERT INTO campaign (id, name, client_code, total_stock, remaining_stock, active) VALUES
-  (1, 'Raya Flash Deal', 'ACME', 100, 100, TRUE),
-  (2, 'Merdeka Giveaway', 'NOVA', 50, 50, TRUE),
-  (3, 'Expired Test Campaign', 'ACME', 10, 0, FALSE);
+  (1, 'Raya Flash Deal', 'ACME', 100, 100, 1),
+  (2, 'Merdeka Giveaway', 'NOVA', 50, 50, 1),
+  (3, 'Expired Test Campaign', 'ACME', 10, 0, 0);
 
 INSERT INTO voucher (id, campaign_id, code, status, redeemed_by, redeemed_at) VALUES
   (1, 1, 'RAYA-0001', 'ACTIVE',   NULL,      NULL),

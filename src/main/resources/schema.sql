@@ -8,7 +8,7 @@ CREATE TABLE campaign (
     client_code     VARCHAR(50)  NOT NULL,
     total_stock     INT          NOT NULL,
     remaining_stock INT          NOT NULL,
-    active          BOOLEAN      NOT NULL DEFAULT TRUE
+    active          BIT      NOT NULL DEFAULT 1
 );
 
 CREATE TABLE voucher (
@@ -17,13 +17,13 @@ CREATE TABLE voucher (
     code        VARCHAR(40)  NOT NULL,
     status      VARCHAR(20)  NOT NULL,
     redeemed_by VARCHAR(80),
-    redeemed_at TIMESTAMP
+    redeemed_at datetime2
 );
 
 CREATE TABLE redemption (
-    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    id          BIGINT IDENTITY(1,1) PRIMARY KEY,
     voucher_id  BIGINT      NOT NULL,
     campaign_id BIGINT      NOT NULL,
     user_id     VARCHAR(80) NOT NULL,
-    created_at  TIMESTAMP   NOT NULL
+    created_at  datetime2   NOT NULL
 );
